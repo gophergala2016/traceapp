@@ -22,4 +22,5 @@ Plans
 
 LICENSE
 -----
-WTFPL/Unlicense dual licensed.
+My code is WTFPL/Unlicense dual licensed. A Bunch of code is copied out of `golang.org/x/tools`,
+which is Apache Licensed.
