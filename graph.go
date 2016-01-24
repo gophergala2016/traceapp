@@ -2,37 +2,20 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os/exec"
 	"strings"
 	"text/template"
 
-	"golang.org/x/tools/go/callgraph/rta"
 	"golang.org/x/tools/go/loader"
-	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
 
-	"github.com/extemporalgenome/slug"
+	"github.com/gophergala2016/traceapp/cha"
+	"github.com/gophergala2016/traceapp/node"
+	"github.com/gophergala2016/traceapp/rta"
 	"github.com/julienschmidt/httprouter"
 )
-
-type Node struct {
-	Name    string   `json:"name"`
-	Imports []string `json:"imports"`
-	Size    int      `json:"size"`
-}
-
-//
-type Graph struct {
-	Nodes []Node `json:"nodes"`
-	// Links []Link `json:"links"`
-}
-
-func (g *Graph) MarshalJSON() ([]byte, error) {
-	return json.Marshal(g.Nodes)
-}
 
 func Grapher(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	repo := ps.ByName("importpath")
@@ -44,8 +27,6 @@ func Grapher(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		return
 	}
 
-	nodes := make([]Node, 0)
-
 	var conf loader.Config
 	conf.Import(repo)
 	prog, err := conf.Load()
@@ -56,60 +37,14 @@ func Grapher(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	ssaProg := ssautil.CreateProgram(prog, 0)
 	ssaProg.Build()
 
-	main, err := mainPackage(ssaProg, false)
+	var nodes []node.Node
+	nodes, err = rta.GetNodes(ssaProg)
 	if err != nil {
-		panic(err)
-	}
-
-	roots := []*ssa.Function{
-		main.Func("init"),
-		main.Func("main"),
-	}
-
-	added := make(map[string]struct{})
-	extraImports := make(map[string][]string)
-
-	callgraph := rta.Analyze(roots, true)
-	callgraph.CallGraph.DeleteSyntheticNodes()
-	for _, bar := range callgraph.CallGraph.Nodes {
-		_, ok := added[bar.Func.Package().String()]
-		if !ok {
-			for _, edge := range bar.Out {
-				if extraImports[edge.Callee.Func.Package().String()] == nil {
-					extraImports[edge.Callee.Func.Package().String()] = make([]string, 0)
-				}
-				extraImports[edge.Callee.Func.Package().String()] = append(extraImports[edge.Callee.Func.Package().String()], strings.TrimPrefix(slug.Slug(bar.Func.Package().String()), "package-"))
-			}
-
-			added[bar.Func.Package().String()] = struct{}{}
+		nodes, err = cha.GetNodes(ssaProg)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
-
-	added = make(map[string]struct{})
-	for _, bar := range callgraph.CallGraph.Nodes {
-		_, ok := added[bar.Func.Package().String()]
-		if !ok {
-			var imports []string
-			for _, edge := range bar.In {
-				imports = append(imports, strings.TrimPrefix(slug.Slug(edge.Caller.Func.Package().String()), "package-"))
-			}
-			imports = append(imports, extraImports[bar.Func.Package().String()]...)
-
-			nodes = append(nodes, Node{Name: strings.TrimPrefix(slug.Slug(bar.Func.Package().String()), "package-"), Imports: imports, Size: len(imports) * 100})
-
-			added[bar.Func.Package().String()] = struct{}{}
-		}
-	}
-
-	// m := make(map[string]struct{})
-	// for _, bar := range callgraph.CallGraph.Nodes {
-	//
-	// 		if _, ok := m[edge.Callee.Func.Package().String()+edge.Caller.Func.Package().String()]; !ok {
-	// 			G.Links = append(G.Links, Link{Source: NodeID(G, edge.Callee.Func.Package().String()), Target: NodeID(G, edge.Caller.Func.Package().String()), Value: 1})
-	// 			m[edge.Callee.Func.Package().String()+edge.Caller.Func.Package().String()] = struct{}{}
-	// 		}
-	// 	}
-	// }
 
 	by, err := json.Marshal(nodes)
 	if err != nil {
@@ -124,23 +59,6 @@ func Grapher(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 
 	tmpl, _ := template.New("foo").Parse(nt)
 	tmpl.Execute(w, data)
-}
-
-var packages map[string]int
-var currentID int
-
-func packageToID(pkg string) int {
-	if packages == nil {
-		packages = make(map[string]int)
-	}
-
-	i, ok := packages[pkg]
-	if ok {
-		return i
-	}
-	currentID += 1
-	packages[pkg] = currentID
-	return currentID
 }
 
 var nt = `
@@ -322,33 +240,3 @@ function dot(a, b) {
   </body>
 </html>
 `
-
-// The resulting package has a main() function.
-func mainPackage(prog *ssa.Program, tests bool) (*ssa.Package, error) {
-	pkgs := prog.AllPackages()
-
-	// TODO(adonovan): allow independent control over tests, mains and libraries.
-	// TODO(adonovan): put this logic in a library; we keep reinventing it.
-
-	if tests {
-		// If -test, use all packages' tests.
-		if len(pkgs) > 0 {
-			if main := prog.CreateTestMainPackage(pkgs...); main != nil {
-				return main, nil
-			}
-		}
-		return nil, fmt.Errorf("no tests")
-	}
-
-	// Otherwise, use the first package named main.
-	for _, pkg := range pkgs {
-		if pkg.Pkg.Name() == "main" {
-			if pkg.Func("main") == nil {
-				return nil, fmt.Errorf("no func main() in main package")
-			}
-			return pkg, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no main package")
-}
